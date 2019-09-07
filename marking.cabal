@@ -1,0 +1,23 @@
+name: marking
+version: 0.1
+cabal-version: >= 1.8
+build-type: Simple
+
+executable marking
+  hs-source-dirs: .
+  main-is: Marking.hs
+  build-depends:
+      base
+    , aeson
+    , base64-bytestring
+    , bytestring
+    , containers
+    , ghcjs-dom
+    , lens
+    , raw-strings-qq
+    , reflex-dom
+    , semantic-reflex
+    , text
+  ghc-options: -Wall -threaded
+  if os(darwin)
+     ghc-options: -dynamic

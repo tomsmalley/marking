@@ -1,27 +1,19 @@
-{ obelisk ? import ./.obelisk/impl {
-    system = builtins.currentSystem;
-    iosSdkVersion = "10.2";
-    # You must accept the Android Software Development Kit License Agreement at
-    # https://developer.android.com/studio/terms in order to build Android apps.
-    # Uncomment and set this to `true` to indicate your acceptance:
-    # config.android_sdk.accept_license = false;
-  }
-}:
-with obelisk;
-let pkgs = obelisk.nixpkgs;
-in project ./. ({ ... }: {
-  android.applicationId = "systems.obsidian.obelisk.examples.minimal";
-  android.displayName = "Obelisk Minimal Example";
-  ios.bundleIdentifier = "systems.obsidian.obelisk.examples.minimal";
-  ios.bundleName = "Obelisk Minimal Example";
-  overrides = self: super: let
-    semantic-reflex = (pkgs.fetchFromGitHub {
-      owner = "tomsmalley";
-      repo = "semantic-reflex";
-      rev = "a354fda1f34d06b72fd99dea1206606b5210ecdd";
-      sha256 = "1li8w95ibq4xm717clz5wz23kdp15j9vrqb1kq64d5ld0fjx7ln0";
-    }) + "/semantic-reflex";
-  in {
-    semantic-reflex = pkgs.haskell.lib.dontHaddock (self.callCabal2nix "semantic-reflex" semantic-reflex {});
+(import ./reflex-platform {}).project ({ pkgs, hackGet, ... }: {
+  packages = {
+    marking = ./.;
+  };
+  overrides = self: super: with pkgs.haskell.lib; {
+    semantic-reflex = dontHaddock (self.callCabal2nix
+      "semantic-reflex"
+      (pkgs.fetchFromGitHub {
+        owner = "tomsmalley";
+        repo = "semantic-reflex";
+        rev = "f91f45348dc372522f56d41e1c3b64d3e1bb13c1";
+        sha256 = "14x2i8ngwgmap8kw98a3rbxmzhhmdzc5qan9ld404d3pq451if35";
+      } + "/semantic-reflex") {});
+  };
+  shells = {
+    ghc = ["marking"];
+    ghcjs = ["marking"];
   };
 })

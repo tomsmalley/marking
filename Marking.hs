@@ -1,17 +1,17 @@
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecursiveDo #-}
-{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 
-module Frontend (frontend) where
+{-# OPTIONS_GHC -Wno-simplifiable-class-constraints #-}
 
-import Common.Route
 import Control.Lens (over, set)
 import Control.Lens.TH (makeLenses)
 import Control.Monad (when, void, join, replicateM_)
@@ -28,9 +28,8 @@ import Data.Set (Set)
 import Data.Text (Text)
 import GHC.Generics (Generic)
 import GHCJS.DOM.Types (MonadJSM, liftJSM)
-import Obelisk.Frontend
-import Obelisk.Route
-import Reflex.Dom.SemanticUI
+import Reflex.Dom (mainWidgetWithHead)
+import Reflex.Dom.SemanticUI hiding (mainWidgetWithHead)
 import Text.RawString.QQ
 
 import qualified Data.Aeson as Aeson
@@ -54,8 +53,9 @@ import qualified GHCJS.DOM.Types as Types
 import qualified GHCJS.DOM.Window as Window
 
 -- TODO
--- Un-obelisk
 -- Generic comments
+
+type AppWidget js t m = (MonadWidget t m, Prerender js t m)
 
 -- | If the element exists, delete it; otherwise insert it.
 flipSet :: Ord a => a -> Set a -> Set a
@@ -135,37 +135,6 @@ instance ToJSON Data
 instance FromJSON Data
 makeLenses 'Data
 
-frontend :: Frontend (R FrontendRoute)
-frontend = Frontend
-  { _frontend_head = do
-    el "title" $ text appTitle
-    elAttr "link" ("rel" =: "stylesheet" <> "type" =: "text/css" <> "href" =: "https://cdn.jsdelivr.net/npm/semantic-ui@2.4.2/dist/semantic.min.css") blank
-    el "style" $ text css
-  , _frontend_body = do
-    prerender_ blank $ do
-      pb <- getPostBuild
-      d <- delay 0.2 pb
-      void $ runWithReplace blank $ app <$ d
-  }
-
-css :: Text
-css = [r|
-  @media print {
-    body > * { display: none !important }
-    body > .students { display: block !important }
-  }
-  body { padding: 1rem; }
-  .students { display: none; }
-  .students .student { page-break-after: always; display: flex; flex-direction: column; height: calc(100vh - 1rem); }
-  .student-name { position: absolute; }
-  .feedback-title { text-align: center; text-decoration: underline; }
-  .feedback-block { border: 1px solid black; padding: 1rem; margin: 1rem 0; }
-  .feedback-block.grow { flex-grow: 1; }
-  .feedback-block .type { text-align: center; text-decoration: underline; }
-  .self-reflection { text-align: center; font-weight: bold; text-decoration: underline; margin: 3rem 0; }
-  .line { height: 1.5rem; border-bottom: 1px solid black; }
-|]
-
 appTitle :: Text
 appTitle = "Mega marking tool 5000"
 
@@ -188,14 +157,14 @@ saveData dd = performEvent_ $ ffor dd $ \d -> liftJSM $ do
   Storage.setItem storage dataStorageKey $ LT.toStrict $ Aeson.encodeToLazyText d
 
 -- | Button to save some data to a file
-saveFile :: (ToJSON a, MonadWidget t m) => Text -> Dynamic t a -> m ()
+saveFile :: (ToJSON a, AppWidget js t m) => Text -> Dynamic t a -> m ()
 saveFile name d = do
   let b64 = T.decodeUtf8 . B64.encode . LBS.toStrict . Aeson.encode <$> d
       as = ffor b64 $ \b -> "download" =: name <> "href" =: ("data:text/plain;base64," <> b)
   void $ button (def & buttonConfig_type .~ LinkButton & attrs .~ Dyn as) $ text "Save"
 
 -- | Button to load some data from a file
-loadFile :: (FromJSON a, MonadWidget t m) => m (Event t a)
+loadFile :: (FromJSON a, AppWidget js t m) => m (Event t a)
 loadFile = do
   fileInput <- inputElement $ def & set initialAttributes fileInputAttrs
   let newFile = fmapMaybe listToMaybe $ updated $ _inputElement_files fileInput
@@ -221,7 +190,7 @@ listEndoWithKey
   => Dynamic t (Map k v) -> (k -> Dynamic t v -> m (Event t (Endo a))) -> m (Event t (Endo a))
 listEndoWithKey l = (fmap . fmap) fold . listViewWithKey l
 
-editableContent :: MonadWidget t m => m () -> m (Event t (Maybe Text))
+editableContent :: AppWidget js t m => m () -> m (Event t (Maybe Text))
 editableContent content = mdo
   let s = "min-width: 1rem; display: inline-block; outline: none"
   e <- fst <$> elAttr' "span" ("contenteditable" =: "true" <> "style" =: s) content
@@ -235,7 +204,7 @@ editableContent content = mdo
     pure tc
 
 fancyFeedback
-  :: MonadWidget t m
+  :: AppWidget js t m
   => Dynamic t Summary
   -> Maybe FeedbackKey
   -> m (Event t (Endo Data))
@@ -258,7 +227,7 @@ fancyFeedback summary mFeedback = do
   mapAccum_ (\old new -> (new, Endo $ f old new)) mFeedback newText
 
 feedbackWidget
-  :: MonadWidget t m
+  :: AppWidget js t m
   => Dynamic t Data -> m (Event t (Endo Data))
 feedbackWidget dynData = list (def & listConfig_selection |~ True) $ do
   alter <- listEndoWithKey (_data_feedback <$> dynData) $ \fb feedback -> do
@@ -282,7 +251,7 @@ feedbackWidget dynData = list (def & listConfig_selection |~ True) $ do
   pure $ fold [new, alter]
 
 fancyStudent
-  :: MonadWidget t m
+  :: AppWidget js t m
   => Maybe Name
   -> m (Event t (Endo Data))
 fancyStudent mName = do
@@ -299,7 +268,7 @@ fancyStudent mName = do
   mapAccum_ (\old new -> (new, Endo $ f old new)) mName newText
 
 studentsWidget
-  :: MonadWidget t m
+  :: AppWidget js t m
   => Dynamic t Data -> m (Event t (Endo Data))
 studentsWidget dynData = list (def & listConfig_selection |~ True) $ do
   alter <- listEndoWithKey (_data_students <$> dynData) $ \name feedback -> do
@@ -325,7 +294,7 @@ studentsWidget dynData = list (def & listConfig_selection |~ True) $ do
   pure $ new <> alter
 
 summaryDropdown
-  :: forall t m. MonadWidget t m
+  :: forall js t m. AppWidget js t m
   => Dynamic t Summary -> m (Event t Summary)
 summaryDropdown summary = do
   let wrapper :: (forall cfg. HasElConfig t cfg => cfg -> cfg) -> m a -> m (El t, a)
@@ -341,7 +310,7 @@ summaryDropdown summary = do
   pure $ fmapMaybe id e
 
 -- | Main app
-app :: forall t m. MonadWidget t m => m ()
+app :: AppWidget js t m => m ()
 app = do
   dynData <- container def $ mdo
 
@@ -399,3 +368,26 @@ app = do
       text "Self-reflection: What do you need to focus on next time?"
       replicateM_ 10 $ divClass "line" blank
 
+headContents :: DomBuilder t m => m ()
+headContents = do
+  el "title" $ text appTitle
+  elAttr "link" ("rel" =: "stylesheet" <> "type" =: "text/css" <> "href" =: "https://cdn.jsdelivr.net/npm/semantic-ui@2.4.2/dist/semantic.min.css") blank
+  el "style" $ text [r|
+    @media print {
+      body > * { display: none !important }
+      body > .students { display: block !important }
+    }
+    body { padding: 1rem; }
+    .students { display: none; }
+    .students .student { page-break-after: always; display: flex; flex-direction: column; height: calc(100vh - 1rem); }
+    .student-name { position: absolute; }
+    .feedback-title { text-align: center; text-decoration: underline; }
+    .feedback-block { border: 1px solid black; padding: 1rem; margin: 1rem 0; }
+    .feedback-block.grow { flex-grow: 1; }
+    .feedback-block .type { text-align: center; text-decoration: underline; }
+    .self-reflection { text-align: center; font-weight: bold; text-decoration: underline; margin: 3rem 0; }
+    .line { height: 1.5rem; border-bottom: 1px solid black; }
+  |]
+
+main :: IO ()
+main = mainWidgetWithHead headContents app
