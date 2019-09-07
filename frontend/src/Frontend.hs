@@ -1,7 +1,5 @@
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
@@ -10,59 +8,70 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
-module Frontend where
 
+module Frontend (frontend) where
+
+import Common.Route
 import Control.Lens (over, set)
 import Control.Lens.TH (makeLenses)
-import Control.Monad (guard, (<=<), when, void)
-import Control.Monad.IO.Class
+import Control.Monad (when, void, join, replicateM_)
 import Control.Monad.Fix (MonadFix)
+import Control.Monad.IO.Class
 import Data.Aeson (ToJSON(..), FromJSON(..), (.=), (.:))
 import Data.Aeson.TH (deriveJSON)
 import Data.Foldable (fold)
 import Data.Map (Map)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Monoid (Endo (..))
 import Data.Ord (comparing)
 import Data.Set (Set)
 import Data.Text (Text)
+import GHC.Generics (Generic)
+import GHCJS.DOM.Types (MonadJSM, liftJSM)
 import Obelisk.Frontend
 import Obelisk.Route
-import Reflex.Network
+import Reflex.Dom.SemanticUI
 import Text.RawString.QQ
+
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Text as Aeson
-import qualified Data.Char as Char
+import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Map as M
 import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.Lazy as LT
-
-import GHC.Generics (Generic)
-import Common.Route
-
-import Reflex.Dom (keypress)
-import Reflex.Dom.SemanticUI
-
-import GHCJS.DOM.Types (MonadJSM)
 import qualified GHCJS.DOM as DOM
-import qualified GHCJS.DOM.Document as Document
-import qualified GHCJS.DOM.HTMLElement as HTMLElement
-import qualified GHCJS.DOM.HTMLInputElement as InputElement
-import qualified GHCJS.DOM.HTMLTextAreaElement as TextArea
-import qualified GHCJS.DOM.Node as Node
-import qualified GHCJS.DOM.Types as DOM
-import qualified GHCJS.DOM.Storage as Storage
-import qualified GHCJS.DOM.Window as Window
 import qualified GHCJS.DOM.EventM as EventM
+import qualified GHCJS.DOM.FileReader     as FileReader
 import qualified GHCJS.DOM.GlobalEventHandlers as GlobalEventHandlers
+import qualified GHCJS.DOM.HTMLElement as HTMLElement
+import qualified GHCJS.DOM.Node as Node
+import qualified GHCJS.DOM.Storage as Storage
+import qualified GHCJS.DOM.Types as DOM
+import qualified GHCJS.DOM.Types as Types
+import qualified GHCJS.DOM.Window as Window
 
 -- TODO
--- Semi-auto date
--- Title on printed pages
--- Save / load files
 -- Un-obelisk
+-- Generic comments
+
+-- | If the element exists, delete it; otherwise insert it.
+flipSet :: Ord a => a -> Set a -> Set a
+flipSet a s = if S.member a s then S.delete a s else S.insert a s
+
+-- | Alter the item if it exists
+alterMember :: Ord k => k -> k -> Set k -> Set k
+alterMember old new s
+  | S.member old s = S.insert new $ S.delete old s
+  | otherwise = s
+
+-- | Alter the key if it exists
+alterKey :: Ord k => k -> k -> Map k a -> Map k a
+alterKey old new m = case M.lookup old m of
+  Just v -> M.insert new v $ M.delete old m
+  Nothing -> m
 
 data Summary = Strengths | Improvements deriving (Eq, Ord, Show, Generic, Enum, Bounded)
 instance ToJSON Summary where
@@ -91,8 +100,6 @@ displayName :: DomBuilder t m => Name -> m ()
 displayName = text . getName
 
 type FeedbackKey = Text
-defaultFeedbackKey :: FeedbackKey
-defaultFeedbackKey = "Tag"
 
 data Feedback = Feedback
   { _feedback_message :: Text
@@ -122,6 +129,7 @@ type Students = Map Name (Set FeedbackKey)
 data Data = Data
   { _data_feedback :: Map FeedbackKey Feedback
   , _data_students :: Students
+  , _data_title :: Text
   } deriving (Eq, Ord, Show, Generic)
 instance ToJSON Data
 instance FromJSON Data
@@ -133,28 +141,33 @@ frontend = Frontend
     el "title" $ text appTitle
     elAttr "link" ("rel" =: "stylesheet" <> "type" =: "text/css" <> "href" =: "https://cdn.jsdelivr.net/npm/semantic-ui@2.4.2/dist/semantic.min.css") blank
     el "style" $ text css
-  , _frontend_body = prerender_ blank app
+  , _frontend_body = do
+    prerender_ blank $ do
+      pb <- getPostBuild
+      d <- delay 0.2 pb
+      void $ runWithReplace blank $ app <$ d
   }
 
 css :: Text
 css = [r|
-  .students { display: block; }
-  .students .student { page-break-after: always; }
+  @media print {
+    body > * { display: none !important }
+    body > .students { display: block !important }
+  }
+  body { padding: 1rem; }
+  .students { display: none; }
+  .students .student { page-break-after: always; display: flex; flex-direction: column; height: calc(100vh - 1rem); }
+  .student-name { position: absolute; }
+  .feedback-title { text-align: center; text-decoration: underline; }
+  .feedback-block { border: 1px solid black; padding: 1rem; margin: 1rem 0; }
+  .feedback-block.grow { flex-grow: 1; }
+  .feedback-block .type { text-align: center; text-decoration: underline; }
+  .self-reflection { text-align: center; font-weight: bold; text-decoration: underline; margin: 3rem 0; }
+  .line { height: 1.5rem; border-bottom: 1px solid black; }
 |]
 
 appTitle :: Text
 appTitle = "Mega marking tool 5000"
-
--- | Simple transition
-transition
-  :: (Reflex t, HasAction t conf)
-  => TransitionType -> Bool -> Event t Bool -> (conf -> conf)
-transition t i evt = (& action ?~ def
-  { _action_transition = ffor evt $ \b -> Transition t (Just $ toDir b) def
-  , _action_initialDirection = toDir i
-  , _action_transitionStateClasses = forceVisible
-  })
-    where toDir x = if x then In else Out
 
 -- | Key at which to store data in session storage
 dataStorageKey :: Text
@@ -162,52 +175,58 @@ dataStorageKey = "data"
 
 -- | Load saved data from session storage
 loadData :: MonadJSM m => m Data
-loadData = DOM.liftJSM $ do
+loadData = liftJSM $ do
   storage <- Window.getSessionStorage =<< DOM.currentWindowUnchecked
   mx <- Storage.getItem storage dataStorageKey
-  pure $ fromMaybe (Data mempty mempty) $ Aeson.decodeStrict . T.encodeUtf8 =<< mx
+  pure $ fromMaybe (Data mempty mempty "") $ Aeson.decodeStrict . T.encodeUtf8 =<< mx
 
 -- | Save data to session storage
 saveData :: (MonadJSM (Performable m), PerformEvent t m) => Event t Data -> m ()
-saveData dd = performEvent_ $ ffor dd $ \d -> DOM.liftJSM $ do
+saveData dd = performEvent_ $ ffor dd $ \d -> liftJSM $ do
   window <- DOM.currentWindowUnchecked
   storage <- Window.getSessionStorage window
   Storage.setItem storage dataStorageKey $ LT.toStrict $ Aeson.encodeToLazyText d
+
+-- | Button to save some data to a file
+saveFile :: (ToJSON a, MonadWidget t m) => Text -> Dynamic t a -> m ()
+saveFile name d = do
+  let b64 = T.decodeUtf8 . B64.encode . LBS.toStrict . Aeson.encode <$> d
+      as = ffor b64 $ \b -> "download" =: name <> "href" =: ("data:text/plain;base64," <> b)
+  void $ button (def & buttonConfig_type .~ LinkButton & attrs .~ Dyn as) $ text "Save"
+
+-- | Button to load some data from a file
+loadFile :: (FromJSON a, MonadWidget t m) => m (Event t a)
+loadFile = do
+  fileInput <- inputElement $ def & set initialAttributes fileInputAttrs
+  let newFile = fmapMaybe listToMaybe $ updated $ _inputElement_files fileInput
+  loaded <- performEventAsync $ ffor newFile $ \file cb -> liftJSM $ do
+    fr <- FileReader.newFileReader
+    FileReader.readAsText fr (pure file) (Nothing @Text)
+    void $ fr `EventM.on` FileReader.loadEnd $ liftJSM $ do
+      liftIO . cb . join =<< traverse (Types.fromJSVal . Types.unStringOrArrayBuffer) =<< FileReader.getResult fr
+  (e, _) <- button' def $ text "Load"
+  let htmlElement = DOM.HTMLElement . DOM.unElement $ _element_raw e
+  void $ liftJSM $ htmlElement `EventM.on` GlobalEventHandlers.click $ liftJSM $
+    HTMLElement.click (_inputElement_raw fileInput)
+  pure $ fmapMaybe (Aeson.decodeStrict . T.encodeUtf8 =<<) loaded
+  where
+    fileInputAttrs = M.fromList
+      [ ("type", "file")
+      , ("style", "display: none")
+      , ("accept", ".txt")
+      ]
 
 listEndoWithKey
   :: (Ord k, Adjustable t m, PostBuild t m, MonadFix m, MonadHold t m)
   => Dynamic t (Map k v) -> (k -> Dynamic t v -> m (Event t (Endo a))) -> m (Event t (Endo a))
 listEndoWithKey l = (fmap . fmap) fold . listViewWithKey l
 
-data Alter p a
-  = Alter_Save a
-  | Alter_Edit p
-  | Alter_Cancel
-
-fanAlter :: Reflex t => Event t (Alter p a) -> (Event t (), Event t p, Event t a)
-fanAlter e =
-  ( fmapMaybe (\case Alter_Cancel -> Just (); _ -> Nothing) e
-  , fmapMaybe (\case Alter_Edit p -> Just p; _ -> Nothing) e
-  , fmapMaybe (\case Alter_Save a -> Just a; _ -> Nothing) e
-  )
-
--- | Generic in place altering
-alterWidget
-  :: (Adjustable t m, MonadFix m, MonadHold t m)
-  => (p -> m (Event t (Alter p a)))
-  -> m (Event t (Alter p a))
-  -> m (Event t a)
-alterWidget f g = mdo
-  (cancel, edit, save) <- fmap (fanAlter . switch . current) $ networkHold g $ leftmost
-    [g <$ save, g <$ cancel, f <$> edit]
-  pure save
-
 editableContent :: MonadWidget t m => m () -> m (Event t (Maybe Text))
 editableContent content = mdo
   let s = "min-width: 1rem; display: inline-block; outline: none"
   e <- fst <$> elAttr' "span" ("contenteditable" =: "true" <> "style" =: s) content
   let htmlElement = DOM.HTMLElement . DOM.unElement $ _element_raw e
-  DOM.liftJSM $ htmlElement `EventM.on` GlobalEventHandlers.keyDown $ do
+  void $ liftJSM $ htmlElement `EventM.on` GlobalEventHandlers.keyDown $ do
     key <- EventM.uiKeyCode
     when (key == 13) $ HTMLElement.blur htmlElement
   performEvent $ ffor (domEvent Blur e) $ \_ -> do
@@ -220,7 +239,7 @@ fancyFeedback
   => Dynamic t Summary
   -> Maybe FeedbackKey
   -> m (Event t (Endo Data))
-fancyFeedback summary mFeedback = mdo
+fancyFeedback summary mFeedback = do
   let conf = def
         & labelConfig_horizontal |~ True
         & labelConfig_color .~ Dyn (Just . summaryColour <$> summary)
@@ -238,21 +257,6 @@ fancyFeedback summary mFeedback = mdo
         . over data_students (M.map (alterMember k' k))
   mapAccum_ (\old new -> (new, Endo $ f old new)) mFeedback newText
 
-alterMember :: Ord k => k -> k -> Set k -> Set k
-alterMember old new s
-  | S.member old s = S.insert new $ S.delete old s
-  | otherwise = s
-
-alterKey :: Ord k => k -> k -> Map k a -> Map k a
-alterKey old new m = case M.lookup old m of
-  Just v -> M.insert new v $ M.delete old m
-  Nothing -> m
-
---mapAccum_
---  :: forall t m a b c. (Reflex t, MonadHold t m, MonadFix m)
---  => (a -> b -> (a, c)) -> a -> Event t b -> m (Event t c)
-
-
 feedbackWidget
   :: MonadWidget t m
   => Dynamic t Data -> m (Event t (Endo Data))
@@ -267,17 +271,21 @@ feedbackWidget dynData = list (def & listConfig_selection |~ True) $ do
         , ffor newMsg $ \m -> Endo $ over data_feedback (M.adjust (feedback_message .~ m) fb)
         , ffor newSummary $ \s -> Endo $ over data_feedback (M.adjust (feedback_summary .~ s) fb)
         ]
-  new <- fmap (domEvent Click . fst) $ listItem' def $ do
-      icon "plus" $ def & style .~ "float: left; margin: 0 1rem"
-      el' "div" (text "Add more feedback")
-  let new' = Endo $ over data_feedback $ M.insert defaultFeedbackKey defaultFeedback
-  pure $ fold [new' <$ new, alter]
+
+  new <- form def $ input (def & inputConfig_action |?~ RightAction) $ mdo
+    t <- fmap value $ textInput $ def
+      & textInputConfig_placeholder |~ "Add Feedback"
+      & textInputConfig_value .~ SetValue "" (Just $ "" <$ e)
+    e <- button (def & buttonConfig_icon |~ True & buttonConfig_type .~ SubmitButton) $ icon "plus" def
+    pure $ attachWith (\f _ -> Endo $ over data_feedback $ M.insert f defaultFeedback) (current t) e
+
+  pure $ fold [new, alter]
 
 fancyStudent
   :: MonadWidget t m
   => Maybe Name
   -> m (Event t (Endo Data))
-fancyStudent mName = mdo
+fancyStudent mName = do
   let conf = def & labelConfig_basic |~ True
   newText <- label conf $ do
     newText <- editableContent $ maybe blank displayName mName
@@ -297,101 +305,24 @@ studentsWidget dynData = list (def & listConfig_selection |~ True) $ do
   alter <- listEndoWithKey (_data_students <$> dynData) $ \name feedback -> do
     listItem def $ do
       newKey <- fancyStudent (Just name)
-      strengths <- feedbackDropdown dynData Strengths
-      improvements <- feedbackDropdown dynData Improvements
-      let fbs = M.restrictKeys . _data_feedback <$> dynData <*> feedback
-      del <- fmap (switch . current . fmap (leftmost . M.elems)) $ listWithKey fbs $ \f fb -> do
-        let c = Just . summaryColour . _feedback_summary <$> fb
-        label (def & labelConfig_color .~ Dyn c) $ do
-          text f
-          (f <$) . domEvent Click <$> icon' "delete" def
+      swap <- fmap (switch . current . fmap (leftmost . M.elems)) $ listWithKey (_data_feedback <$> dynData) $ \k f -> do
+        let sel = S.member k <$> feedback
+            conf = def
+              & labelConfig_basic .~ Dyn (fmap not sel)
+              & labelConfig_color .~ Dyn (Just . summaryColour . _feedback_summary <$> f)
+        (e, _) <- label' conf $ text k
+        pure $ k <$ domEvent Click e
       pure $ fold
         [ newKey
-        , ffor (strengths <> improvements) $ \g -> Endo $ over data_students (M.adjust (S.insert g) name)
-        , ffor del $ \d -> Endo $ over data_students (M.adjust (S.delete d) name)
+        , ffor swap $ \d -> Endo $ over data_students (M.adjust (flipSet d) name)
         ]
-  new <- fmap (domEvent Click . fst) $ listItem' def $ do
-      icon "plus" $ def & style .~ "float: left; margin: 0 1rem"
-      el' "div" (text "Add student")
-  let new' = Endo $ over data_students $ M.insert (Name "Student") mempty
-  pure $ fold [new' <$ new, alter]
-
-
-addStudentWidget :: MonadWidget t m => m (Event t (Endo Data))
-addStudentWidget = form def $ input (def & inputConfig_action |?~ RightAction) $ mdo
-  t <- fmap value $ textInput $ def
-    & textInputConfig_placeholder |~ "Add Student"
-    & textInputConfig_value .~ SetValue "" (Just $ "" <$ e)
-  e <- button (def & buttonConfig_icon |~ True & buttonConfig_type .~ SubmitButton) $ icon "plus" def
-  pure $ attachWith (\s _ -> Endo $ over data_students $ M.insert (Name s) mempty) (current t) e
-
-studentsWidgetOld
-  :: MonadWidget t m
-  => Dynamic t Data -> m (Event t (Endo Data))
-studentsWidgetOld dynData = el "table" $ listEndoWithKey (_data_students <$> dynData) $ \n fs -> el "tr" $ do
-    deleteThisStudent <- el "td" $ label (def & labelConfig_basic |~ True) $ do
-      displayName n
-      domEvent Click <$> icon' "delete" def
-    alterFeedback <- el "td" $ do
-      strengths <- feedbackDropdown dynData Strengths
-      improvements <- feedbackDropdown dynData Improvements
-
-      let fbs = M.restrictKeys . _data_feedback <$> dynData <*> fs
-      del <- fmap (switch . current . fmap (leftmost . M.elems)) $ listWithKey fbs $ \f fb -> do
-        let c = Just . summaryColour . _feedback_summary <$> fb
-        label (def & labelConfig_color .~ Dyn c) $ do
-          text f
-          (f <$) . domEvent Click <$> icon' "delete" def
-      pure $ leftmost
-        [ S.insert <$> strengths
-        , S.insert <$> improvements
-        , S.delete <$> del
-        ]
-    pure $ fold
-      [ ffor alterFeedback $ \f -> Endo $ over data_students (M.adjust f n)
-      , Endo (over data_students (M.delete n)) <$ deleteThisStudent
-      ]
-
-app :: forall t m. MonadWidget t m => m ()
-app = mdo
-
-  initData <- loadData
-  dynData <- foldDyn appEndo initData $ fold
-    [ alterFeedback, loadFeedback
-    , addStudent, alterStudents, loadStudents
-    ]
-  saveData $ updated dynData
-
-  el "h1" $ text appTitle
-  el "h2" $ text "Feedback"
-  alterFeedback <- feedbackWidget dynData
-
-  -- Load pasted feedback
-  loadFeedback <- fmap (Endo . over data_feedback . const) <$>
-    loadJson "Paste feedback here" (_data_feedback <$> dynData)
-
-  el "h2" $ text "Students"
-  addStudent <- addStudentWidget
-
-  alterStudents <- studentsWidget dynData
-
-  -- Load pasted students
-  loadStudents <- fmap (Endo . over data_students . const . M.fromSet (const mempty)) <$>
-    loadJson "Paste students here" (M.keysSet . _data_students <$> dynData)
-
-  _ <- divClass "students" $ listWithKey (_data_students <$> dynData) $ \n fs -> divClass "student" $ do
-    pageHeader H1 (def & classes .~ "name") $ displayName n
-    divClass "feedback" $ do
-      let fs' = M.restrictKeys . _data_feedback <$> dynData <*> fs
-          filtered n' = M.mapMaybe (\f -> _feedback_message f <$ guard (_feedback_summary f == n')) <$> fs'
-      pageHeader H4 def $ text "Strengths"
-      _ <- listWithKey (filtered Strengths) $ \_ feedback -> do
-        divClass "fb" $ dynText feedback
-      pageHeader H4 def $ text "Improvements"
-      listWithKey (filtered Improvements) $ \_ feedback -> do
-        divClass "fb" $ dynText feedback
-
-  pure ()
+  new <- form def $ input (def & inputConfig_action |?~ RightAction) $ mdo
+    t <- fmap value $ textInput $ def
+      & textInputConfig_placeholder |~ "Add Student"
+      & textInputConfig_value .~ SetValue "" (Just $ "" <$ e)
+    e <- button (def & buttonConfig_icon |~ True & buttonConfig_type .~ SubmitButton) $ icon "plus" def
+    pure $ attachWith (\s _ -> Endo $ over data_students $ M.insert (Name s) mempty) (current t) e
+  pure $ new <> alter
 
 summaryDropdown
   :: forall t m. MonadWidget t m
@@ -409,77 +340,62 @@ summaryDropdown summary = do
     TaggedStatic $ M.fromList $ (\x -> (x, text $ tshow x)) <$> [minBound..maxBound]
   pure $ fmapMaybe id e
 
-feedbackDropdown
-  :: forall t m. MonadWidget t m
-  => Dynamic t Data -> Summary -> m (Event t FeedbackKey)
-feedbackDropdown dynData summary = mdo
-  e' <- delay 0 e
-  let wrapper :: (forall cfg. HasElConfig t cfg => cfg -> cfg) -> m a -> m (El t, a)
-      wrapper f = label' $ f $ def
-        & labelConfig_color |?~ summaryColour summary
-        & labelConfig_basic |~ True
-      conf = def
-        & dropdownConfig_selection |~ False
-        & dropdownConfig_inline |~ True
-  e <- fmap _dropdown_change $ dropdownWithWrapper wrapper conf Nothing (Nothing <$ e') $
-    TaggedDynamic $ M.mapMaybeWithKey (\k f -> text k <$ guard (_feedback_summary f == summary)) . _data_feedback <$> dynData
-  pure $ fmapMaybe id e
+-- | Main app
+app :: forall t m. MonadWidget t m => m ()
+app = do
+  dynData <- container def $ mdo
 
-loadJson :: (MonadWidget t m, FromJSON a, ToJSON a, Monoid a) => Text -> Dynamic t a -> m (Event t a)
-loadJson placeholder contents = form def $ input (def & inputConfig_action |?~ RightAction) $ mdo
-  ti <- do
-    pb <- getPostBuild
-    let enc = LT.toStrict . Aeson.encodeToLazyText
-        enc' = enc <$> contents
-    textInput $ def
-      & textInputConfig_placeholder |~ placeholder
-      & textInputConfig_value . event ?~ leftmost
-        [ updated enc'
-        , tag (current enc') pb
-        , enc mempty <$ clear
-        ]
-  positive <- do
-    (copyButton, _) <- button' (def & buttonConfig_positive .~ Dyn positive) $ text "Copy"
-    (copied, triggerCopy) <- newTriggerEvent
-    DOM.liftJSM $ DOM.uncheckedCastTo DOM.HTMLElement (_element_raw copyButton)
-      `EventM.on` GlobalEventHandlers.click $ do
-        success <- copyToClipboardUsing $ _inputElement_raw $ _textInput_builderElement ti
-        liftIO $ triggerCopy success
-    done <- delay 0.5 copied
-    holdDyn Nothing $ leftmost
-      [ Nothing <$ done
-      , ffor copied $ Just . \case True -> Success; False -> Error
-      ]
-  clear <- button (def & buttonConfig_type .~ SubmitButton) $ text "Clear"
-  pure $ (mempty <$ clear) <> fmapMaybe (Aeson.decodeStrict . T.encodeUtf8) (_textInput_input ti)
+    initData <- loadData
+    dynData <- foldDyn appEndo initData $ alterFeedback <> alterStudents <> alterTitle
+    saveData $ updated dynData
 
--- | Copy the given text to the clipboard
-copyToClipboard
-  :: MonadJSM m
-  => Text -- ^ Text to copy to clipboard
-  -> m Bool -- ^ Did the copy take place successfully?
-copyToClipboard t = do
-  doc <- DOM.currentDocumentUnchecked
-  ta <- DOM.uncheckedCastTo TextArea.HTMLTextAreaElement <$> Document.createElement doc ("textarea" :: Text)
-  TextArea.setValue ta t
-  body <- Document.getBodyUnchecked doc
-  _ <- Node.appendChild body ta
-  HTMLElement.focus ta
-  TextArea.select ta
-  success <- Document.execCommand doc ("copy" :: Text) False (Nothing :: Maybe Text)
-  _ <- Node.removeChild body ta
-  pure success
+    segment (def & segmentConfig_color |?~ Purple) $ pageHeader H1 def $ do
+      text appTitle
+      subHeader $ text "This tool will save your current data in the browser until you close the window."
 
--- | Copy the given text to the clipboard
-copyToClipboardUsing
-  :: MonadJSM m
-  => DOM.HTMLInputElement -- ^ TextArea to copy to clipboard
-  -> m Bool -- ^ Did the copy take place successfully?
-copyToClipboardUsing ta = do
-  doc <- DOM.currentDocumentUnchecked
-  --ta <- DOM.uncheckedCastTo TextArea.HTMLTextAreaElement <$> Document.createElement doc ("textarea" :: Text)
-  body <- Document.getBodyUnchecked doc
-  HTMLElement.focus ta
-  InputElement.select ta
-  success <- Document.execCommand doc ("copy" :: Text) False (Nothing :: Maybe Text)
-  pure success
+    alterTitle <- do
+      i <- input (def & inputConfig_fluid |~ True) $ textInput $ def
+        & textInputConfig_placeholder .~ "Title (appears on printout)"
+        & textInputConfig_value .~ SetValue (_data_title initData) Nothing
+      pure $ Endo . set data_title <$> _textInput_input i
+
+    alterFeedback <- segment def $ do
+      header def $ do
+        text "Feedback"
+        divClass "sub header" $ text "Add different feedback types here. Feedback is referenced by the short name, but the printout will display the full description."
+      alter <- feedbackWidget dynData
+      clear <- (Endo (set data_feedback mempty . over data_students (M.map (const mempty))) <$) <$> button def (text "Clear")
+      load <- fmap (Endo . set data_feedback) <$> loadFile
+      saveFile "feedback" $ _data_feedback <$> dynData
+      pure $ clear <> alter <> load
+
+    alterStudents <- segment def $ do
+      header def $ do
+        text "Students"
+        divClass "sub header" $ text "Add a class of students and give them feedback. Saving/loading will only load the students, not the feedback associated with them."
+      alter <- studentsWidget dynData
+      clear <- (Endo (set data_students mempty) <$) <$> button def (text "Clear")
+      load <- fmap (Endo . set data_students . M.fromSet (const mempty)) <$> loadFile
+      saveFile "students" $ M.keysSet . _data_students <$> dynData
+      pure $ clear <> alter <> load
+
+    pure dynData
+
+  divClass "students" $ void $ listWithKey (_data_students <$> dynData) $ \n fs -> divClass "student" $ do
+    divClass "student-name" $ text "Name: " >> displayName n
+    divClass "feedback-title" $ dynText $ _data_title <$> dynData
+    let feedbackBlock f = divClass "feedback-block" $ do
+          divClass "type" $ text $ tshow f <> ":"
+          let fs' = ffor2 dynData fs $ \d -> M.filter (\fb -> _feedback_summary fb == f) . M.restrictKeys (_data_feedback d)
+          void $ el "ul" $ listWithKey fs' $ \k fb -> el "li" $ do
+            text $ k <> ": "
+            dynText $ _feedback_message <$> fb
+    feedbackBlock Strengths
+    feedbackBlock Improvements
+    divClass "feedback-block grow" $ do
+      divClass "type" $ text "Additional comments:"
+      text "TODO - generic comments"
+    divClass "self-reflection" $ do
+      text "Self-reflection: What do you need to focus on next time?"
+      replicateM_ 10 $ divClass "line" blank
+
