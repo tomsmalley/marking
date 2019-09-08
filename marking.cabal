@@ -15,9 +15,10 @@ executable marking
     , ghcjs-dom
     , lens
     , raw-strings-qq
-    , reflex-dom
     , semantic-reflex
     , text
+  if !impl(ghcjs)
+    build-depends: jsaddle-warp
   ghc-options: -Wall -threaded
   if os(darwin)
      ghc-options: -dynamic

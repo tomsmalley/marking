@@ -1,4 +1,5 @@
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
@@ -9,10 +10,11 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
 
 {-# OPTIONS_GHC -Wno-simplifiable-class-constraints #-}
 
-import Control.Lens (over, set)
+import Control.Lens (over, set, _1, _2)
 import Control.Lens.TH (makeLenses)
 import Control.Monad (when, void, join, replicateM_)
 import Control.Monad.Fix (MonadFix)
@@ -28,8 +30,7 @@ import Data.Set (Set)
 import Data.Text (Text)
 import GHC.Generics (Generic)
 import GHCJS.DOM.Types (MonadJSM, liftJSM)
-import Reflex.Dom (mainWidgetWithHead)
-import Reflex.Dom.SemanticUI hiding (mainWidgetWithHead)
+import Reflex.Dom.SemanticUI
 import Text.RawString.QQ
 
 import qualified Data.Aeson as Aeson
@@ -51,9 +52,9 @@ import qualified GHCJS.DOM.Storage as Storage
 import qualified GHCJS.DOM.Types as DOM
 import qualified GHCJS.DOM.Types as Types
 import qualified GHCJS.DOM.Window as Window
-
--- TODO
--- Generic comments
+#ifndef ghcjs_HOST_OS
+import qualified Language.Javascript.JSaddle.Warp as Warp
+#endif
 
 type AppWidget js t m = (MonadWidget t m, Prerender js t m)
 
@@ -123,12 +124,10 @@ defaultFeedback = Feedback
   , _feedback_message = "Edit here"
   }
 
-type Students = Map Name (Set FeedbackKey)
-
 -- | Entire app state data structure, for serialising
 data Data = Data
   { _data_feedback :: Map FeedbackKey Feedback
-  , _data_students :: Students
+  , _data_students :: Map Name (Set FeedbackKey, Text)
   , _data_title :: Text
   } deriving (Eq, Ord, Show, Generic)
 instance ToJSON Data
@@ -220,10 +219,10 @@ fancyFeedback summary mFeedback = do
       f Nothing (Just k) = over data_feedback (M.insert k defaultFeedback)
       f (Just k) Nothing
         = over data_feedback (M.delete k)
-        . over data_students (M.map (S.delete k))
+        . over data_students (M.map (over _1 $ S.delete k))
       f (Just k') (Just k)
         = over data_feedback (alterKey k' k)
-        . over data_students (M.map (alterMember k' k))
+        . over data_students (M.map (over _1 $ alterMember k' k))
   mapAccum_ (\old new -> (new, Endo $ f old new)) mFeedback newText
 
 feedbackWidget
@@ -250,16 +249,22 @@ feedbackWidget dynData = list (def & listConfig_selection |~ True) $ do
 
   pure $ fold [new, alter]
 
+stopClickPropagation :: (MonadJSM m, RawElement d ~ Types.Element) => Element er d t -> m ()
+stopClickPropagation e = do
+  let htmlElement = DOM.HTMLElement . DOM.unElement $ _element_raw e
+  void $ liftJSM $ htmlElement `EventM.on` GlobalEventHandlers.click $ EventM.stopPropagation
+
 fancyStudent
   :: AppWidget js t m
   => Maybe Name
   -> m (Event t (Endo Data))
 fancyStudent mName = do
   let conf = def & labelConfig_basic |~ True
-  newText <- label conf $ do
+  (e, newText) <- label' conf $ do
     newText <- editableContent $ maybe blank displayName mName
     del <- domEvent Click <$> icon' "delete" def
     pure $ leftmost [fmap Name <$> newText, Nothing <$ del]
+  stopClickPropagation e
   let f Nothing Nothing = id
       f Nothing (Just n) = over data_students (M.insert n mempty)
       f (Just n) Nothing = over data_students (M.delete n)
@@ -272,19 +277,33 @@ studentsWidget
   => Dynamic t Data -> m (Event t (Endo Data))
 studentsWidget dynData = list (def & listConfig_selection |~ True) $ do
   alter <- listEndoWithKey (_data_students <$> dynData) $ \name feedback -> do
-    listItem def $ do
+    (e, (newKey, swap)) <- listItem' def $ do
       newKey <- fancyStudent (Just name)
       swap <- fmap (switch . current . fmap (leftmost . M.elems)) $ listWithKey (_data_feedback <$> dynData) $ \k f -> do
-        let sel = S.member k <$> feedback
+        let sel = S.member k . fst <$> feedback
             conf = def
               & labelConfig_basic .~ Dyn (fmap not sel)
               & labelConfig_color .~ Dyn (Just . summaryColour . _feedback_summary <$> f)
         (e, _) <- label' conf $ text k
+        stopClickPropagation e
         pure $ k <$ domEvent Click e
-      pure $ fold
-        [ newKey
-        , ffor swap $ \d -> Endo $ over data_students (M.adjust (flipSet d) name)
-        ]
+      text " "
+      display $ T.length . snd <$> feedback
+      pure (newKey, swap)
+    let mkAction = def
+          { _action_transition = Transition Instant Nothing def <$ domEvent Click e
+          , _action_initialDirection = Out
+          }
+    comments <- form (def & action ?~ mkAction) $ input (def & inputConfig_fluid |~ True) $ do
+      initialComment <- sample $ snd <$> current feedback
+      fmap _textAreaElement_input $ textAreaElement $ def
+        & initialAttributes .~ "placeholder" =: "Additional comments"
+        & textAreaElementConfig_initialValue .~ initialComment
+    pure $ fold
+      [ newKey
+      , ffor swap $ \d -> Endo $ over data_students (M.adjust (over _1 $ flipSet d) name)
+      , ffor comments $ \c -> Endo $ over data_students (M.adjust (set _2 c) name)
+      ]
   new <- form def $ input (def & inputConfig_action |?~ RightAction) $ mdo
     t <- fmap value $ textInput $ def
       & textInputConfig_placeholder |~ "Add Student"
@@ -333,7 +352,7 @@ app = do
         text "Feedback"
         divClass "sub header" $ text "Add different feedback types here. Feedback is referenced by the short name, but the printout will display the full description."
       alter <- feedbackWidget dynData
-      clear <- (Endo (set data_feedback mempty . over data_students (M.map (const mempty))) <$) <$> button def (text "Clear")
+      clear <- (Endo (set data_feedback mempty . over data_students (M.map (over _1 $ const mempty))) <$) <$> button def (text "Clear")
       load <- fmap (Endo . set data_feedback) <$> loadFile
       saveFile "feedback" $ _data_feedback <$> dynData
       pure $ clear <> alter <> load
@@ -355,7 +374,7 @@ app = do
     divClass "feedback-title" $ dynText $ _data_title <$> dynData
     let feedbackBlock f = divClass "feedback-block" $ do
           divClass "type" $ text $ tshow f <> ":"
-          let fs' = ffor2 dynData fs $ \d -> M.filter (\fb -> _feedback_summary fb == f) . M.restrictKeys (_data_feedback d)
+          let fs' = ffor2 dynData fs $ \d -> M.filter (\fb -> _feedback_summary fb == f) . M.restrictKeys (_data_feedback d) . fst
           void $ el "ul" $ listWithKey fs' $ \k fb -> el "li" $ do
             text $ k <> ": "
             dynText $ _feedback_message <$> fb
@@ -363,7 +382,7 @@ app = do
     feedbackBlock Improvements
     divClass "feedback-block grow" $ do
       divClass "type" $ text "Additional comments:"
-      text "TODO - generic comments"
+      dynText $ snd <$> fs
     divClass "self-reflection" $ do
       text "Self-reflection: What do you need to focus on next time?"
       replicateM_ 10 $ divClass "line" blank
@@ -384,10 +403,14 @@ headContents = do
     .feedback-title { text-align: center; text-decoration: underline; }
     .feedback-block { border: 1px solid black; padding: 1rem; margin: 1rem 0; }
     .feedback-block.grow { flex-grow: 1; }
-    .feedback-block .type { text-align: center; text-decoration: underline; }
+    .feedback-block .type { text-align: center; text-decoration: underline; margin-bottom: 1rem; }
     .self-reflection { text-align: center; font-weight: bold; text-decoration: underline; margin: 3rem 0; }
     .line { height: 1.5rem; border-bottom: 1px solid black; }
   |]
 
 main :: IO ()
-main = mainWidgetWithHead headContents app
+main =
+#ifndef ghcjs_HOST_OS
+  Warp.run 8000 $
+#endif
+    mainWidgetWithHead headContents app
