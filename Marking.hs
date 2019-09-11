@@ -156,15 +156,15 @@ saveData dd = performEvent_ $ ffor dd $ \d -> liftJSM $ do
   Storage.setItem storage dataStorageKey $ LT.toStrict $ Aeson.encodeToLazyText d
 
 -- | Button to save some data to a file
-saveFile :: (ToJSON a, AppWidget js t m) => Text -> Dynamic t a -> m ()
-saveFile name d = do
+saveFile :: (ToJSON a, AppWidget js t m) => Text -> Text -> Dynamic t a -> m ()
+saveFile lbl name d = do
   let b64 = T.decodeUtf8 . B64.encode . LBS.toStrict . Aeson.encode <$> d
       as = ffor b64 $ \b -> "download" =: name <> "href" =: ("data:text/plain;base64," <> b)
-  void $ button (def & buttonConfig_type .~ LinkButton & attrs .~ Dyn as) $ text "Save"
+  void $ button (def & buttonConfig_type .~ LinkButton & attrs .~ Dyn as) $ text lbl
 
 -- | Button to load some data from a file
-loadFile :: (FromJSON a, AppWidget js t m) => m (Event t a)
-loadFile = do
+loadFile :: (FromJSON a, AppWidget js t m) => Text -> m (Event t a)
+loadFile lbl = do
   fileInput <- inputElement $ def & set initialAttributes fileInputAttrs
   let newFile = fmapMaybe listToMaybe $ updated $ _inputElement_files fileInput
   loaded <- performEventAsync $ ffor newFile $ \file cb -> liftJSM $ do
@@ -172,7 +172,7 @@ loadFile = do
     FileReader.readAsText fr (pure file) (Nothing @Text)
     void $ fr `EventM.on` FileReader.loadEnd $ liftJSM $ do
       liftIO . cb . join =<< traverse (Types.fromJSVal . Types.unStringOrArrayBuffer) =<< FileReader.getResult fr
-  (e, _) <- button' def $ text "Load"
+  (e, _) <- button' def $ text lbl
   let htmlElement = DOM.HTMLElement . DOM.unElement $ _element_raw e
   void $ liftJSM $ htmlElement `EventM.on` GlobalEventHandlers.click $ liftJSM $
     HTMLElement.click (_inputElement_raw fileInput)
@@ -334,12 +334,14 @@ app = do
   dynData <- container def $ mdo
 
     initData <- loadData
-    dynData <- foldDyn appEndo initData $ alterFeedback <> alterStudents <> alterTitle
+    dynData <- foldDyn appEndo initData $ alterFeedback <> alterStudents <> alterTitle <> loadAll
     saveData $ updated dynData
 
-    segment (def & segmentConfig_color |?~ Purple) $ pageHeader H1 def $ do
+    loadAll <- segment (def & segmentConfig_color |?~ Purple) $ pageHeader H1 def $ do
       text appTitle
       subHeader $ text "This tool will save your current data in the browser until you close the window."
+      saveFile "Save All" "snapshot" dynData
+      fmap (Endo . const) <$> loadFile "Load All"
 
     alterTitle <- do
       i <- input (def & inputConfig_fluid |~ True) $ textInput $ def
@@ -353,8 +355,8 @@ app = do
         divClass "sub header" $ text "Add different feedback types here. Feedback is referenced by the short name, but the printout will display the full description."
       alter <- feedbackWidget dynData
       clear <- (Endo (set data_feedback mempty . over data_students (M.map (over _1 $ const mempty))) <$) <$> button def (text "Clear")
-      load <- fmap (Endo . set data_feedback) <$> loadFile
-      saveFile "feedback" $ _data_feedback <$> dynData
+      load <- fmap (Endo . set data_feedback) <$> loadFile "Load"
+      saveFile "Save" "feedback" $ _data_feedback <$> dynData
       pure $ clear <> alter <> load
 
     alterStudents <- segment def $ do
@@ -363,8 +365,8 @@ app = do
         divClass "sub header" $ text "Add a class of students and give them feedback. Saving/loading will only load the students, not the feedback associated with them."
       alter <- studentsWidget dynData
       clear <- (Endo (set data_students mempty) <$) <$> button def (text "Clear")
-      load <- fmap (Endo . set data_students . M.fromSet (const mempty)) <$> loadFile
-      saveFile "students" $ M.keysSet . _data_students <$> dynData
+      load <- fmap (Endo . set data_students . M.fromSet (const mempty)) <$> loadFile "Load Class"
+      saveFile "Save Class" "students" $ M.keysSet . _data_students <$> dynData
       pure $ clear <> alter <> load
 
     pure dynData
