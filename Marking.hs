@@ -74,20 +74,28 @@ alterKey old new m = case M.lookup old m of
   Just v -> M.insert new v $ M.delete old m
   Nothing -> m
 
-data Summary = Strengths | Improvements deriving (Eq, Ord, Show, Generic, Enum, Bounded)
+data Summary
+  = Excellent
+  | Good
+  | Improvements
+  deriving (Eq, Ord, Show, Generic, Enum, Bounded)
 instance ToJSON Summary where
   toJSON = \case
-    Strengths -> "strengths"
+    Excellent -> "excellent"
+    Good -> "good"
     Improvements -> "improvements"
 instance FromJSON Summary where
   parseJSON = Aeson.withText "Summary" $ \t -> case T.toLower t of
-    "strengths" -> pure Strengths
+    "strengths" -> pure Excellent
+    "excellent" -> pure Excellent
+    "good" -> pure Good
     "improvements" -> pure Improvements
     _ -> fail "Unexpected value for Summary"
 
 summaryColour :: Summary -> Color
 summaryColour = \case
-  Strengths -> Green
+  Excellent -> Green
+  Good -> Yellow
   Improvements -> Red
 
 newtype Name = Name { getName :: Text } deriving (Eq, Show, Generic)
@@ -120,7 +128,7 @@ makeLenses 'Feedback
 
 defaultFeedback :: Feedback
 defaultFeedback = Feedback
-  { _feedback_summary = Strengths
+  { _feedback_summary = Good
   , _feedback_message = "Edit here"
   }
 
@@ -374,15 +382,22 @@ app = do
   divClass "students" $ void $ listWithKey (_data_students <$> dynData) $ \n fs -> divClass "student" $ do
     divClass "student-name" $ text "Name: " >> displayName n
     divClass "feedback-title" $ dynText $ _data_title <$> dynData
-    let feedbackBlock f = divClass "feedback-block" $ do
-          divClass "type" $ text $ tshow f <> ":"
-          let fs' = ffor2 dynData fs $ \d -> M.filter (\fb -> _feedback_summary fb == f) . M.restrictKeys (_data_feedback d) . fst
-          void $ el "ul" $ listWithKey fs' $ \k fb -> el "li" $ do
-            text $ k <> ": "
-            dynText $ _feedback_message <$> fb
-    feedbackBlock Strengths
+    let feedbackBlock f = do
+          let fs' = ffor2 dynData fs $ \d ->
+                  M.filter (\fb -> _feedback_summary fb == f)
+                . M.restrictKeys (_data_feedback d)
+                . fst
+              as = ffor fs' $ \m -> "class" =: (if M.null m then ("hidden " <>) else id) "feedback-block"
+          elDynAttr "div" as $ do
+            divClass "type" $ text $ tshow f <> ":"
+            void $ el "ul" $ listWithKey fs' $ \k fb -> el "li" $ do
+              text $ k <> ": "
+              dynText $ _feedback_message <$> fb
+    feedbackBlock Excellent
+    feedbackBlock Good
     feedbackBlock Improvements
-    divClass "feedback-block grow" $ do
+    let as = ffor fs $ \f -> "class" =: (if T.null (snd f) then ("hidden " <>) else id) "feedback-block grow"
+    elDynAttr "div" as $ do
       divClass "type" $ text "Additional comments:"
       dynText $ snd <$> fs
     divClass "self-reflection" $ do
@@ -406,6 +421,8 @@ headContents = do
     .feedback-block { border: 1px solid black; padding: 1rem; margin: 1rem 0; }
     .feedback-block.grow { flex-grow: 1; }
     .feedback-block .type { text-align: center; text-decoration: underline; margin-bottom: 1rem; }
+    .feedback-block.hidden:not(.grow) { display: none; }
+    .feedback-block.grow.hidden { visibility: hidden; }
     .self-reflection { text-align: center; font-weight: bold; text-decoration: underline; margin: 3rem 0; }
     .line { height: 1.5rem; border-bottom: 1px solid black; }
   |]
