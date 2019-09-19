@@ -342,19 +342,19 @@ app = do
   dynData <- container def $ mdo
 
     initData <- loadData
-    dynData <- foldDyn appEndo initData $ alterFeedback <> alterStudents <> alterTitle <> loadAll
+    dynData <- foldDyn appEndo initData $ alterFeedback <> alterStudents <> alterTitle <> fmap (Endo . const) loadAll
     saveData $ updated dynData
 
     loadAll <- segment (def & segmentConfig_color |?~ Purple) $ pageHeader H1 def $ do
       text appTitle
       subHeader $ text "This tool will save your current data in the browser until you close the window."
       saveFile "Save All" "snapshot" dynData
-      fmap (Endo . const) <$> loadFile "Load All"
+      loadFile "Load All"
 
     alterTitle <- do
       i <- input (def & inputConfig_fluid |~ True) $ textInput $ def
         & textInputConfig_placeholder .~ "Title (appears on printout)"
-        & textInputConfig_value .~ SetValue (_data_title initData) Nothing
+        & textInputConfig_value .~ SetValue (_data_title initData) (Just $ _data_title <$> loadAll)
       pure $ Endo . set data_title <$> _textInput_input i
 
     alterFeedback <- segment def $ do
